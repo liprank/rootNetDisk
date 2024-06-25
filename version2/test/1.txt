@@ -1,0 +1,177 @@
+/*
+*@file client.c
+*@author ymz
+*@data 6-16 版本1
+*@brief 在客户端输入命令，服务端成功接受
+*@warning 客户端暂时不接受数据
+*/
+
+#include "../include/thread_pool.h" 
+#include <func.h>
+#include "client.h"
+
+int sendn(int sockfd, const void * buff, int len)
+{
+	int left = len;
+	const char * pbuf = buff;
+	int ret = 0;
+	while(left > 0) {
+		ret = send(sockfd, pbuf, left, 0);
+		if(ret == -1) {
+			perror("send");
+			return -1;
+		}
+		pbuf += ret;
+		left -= ret;
+	}
+	return len - left;
+}
+
+
+int recvn(int sockfd, void * buff, int len)
+{
+	int left = len;
+	char * pbuf = buff;
+	int ret = 0;
+	while(left > 0) {
+		ret = recv(sockfd, pbuf, left, 0);
+		if(ret < 0) {
+			perror("recv");
+			break;
+		} else if (ret == 0) {
+			break;
+		}
+		pbuf += ret;
+		left -= ret;
+	}
+	return len - left;
+}
+
+int getCommandType(const char* str){
+	if(!strcmp(str,"pwd"))
+		return CMD_TYPE_PWD;
+	else if(!strcmp(str,"ls"))
+		return CMD_TYPE_LS;
+	else if(!strcmp(str,"cd"))
+		return CMD_TYPE_CD;
+	else if(!strcmp(str,"mkdir"))
+		return CMD_TYPE_MKDIR;
+	else if(!strcmp(str,"rmdir"))
+		return CMD_TYPE_RMDIR;
+	else if(!strcmp(str,"puts"))
+		return CMD_TYPE_PUTS; 
+	else if(!strcmp(str,"gets"))
+		return CMD_TYPE_GETS; 
+	else 
+		return CMD_TYPE_NOTCMD; 
+
+}
+
+int parseCommand(const char* pinput,int len, train_t *pt){
+	char* pstrs[10] = {0};
+
+	char temp[100];
+	strncpy(temp,pinput,sizeof(temp)-1);
+	temp[sizeof(temp)-1] = '\0';
+	
+	int cnt=0;
+	splitString(temp,pstrs,10,&cnt);//分词
+	pt->type=getCommandType(pstrs[0]);//根据第一个字段获取命令类型
+
+	if(cnt>1){
+		pt->len=strlen(pstrs[1]);
+		strncpy(pt->buff,pstrs[1],pt->len);
+	}
+
+	
+	return 0;
+}
+
+int main(int argc, char *argv[])
+{
+    // ./client 192.168.118.128 1234 
+    ARGS_CHECK(argc,3);
+
+    int clientfd = socket(AF_INET,SOCK_STREAM,0);
+    struct sockaddr_in addr;//服务端地址
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(atoi(argv[2]));
+    addr.sin_addr.s_addr = inet_addr(argv[1]);
+    int ret = connect(clientfd,(struct sockaddr *)&addr,sizeof(addr));
+    ERROR_CHECK(ret,-1,"connect");
+
+	fd_set rdset;
+	FD_ZERO(&rdset);
+	train_t t;
+	char buff[1000] = {0};
+
+	while(true){
+		FD_ZERO(&rdset);
+		FD_SET(STDIN_FILENO,&rdset);
+		FD_SET(clientfd,&rdset);
+
+		select(clientfd+1,&rdset,NULL,NULL,NULL);
+
+		//输入命令，发送到服务端
+		if(FD_ISSET(STDIN_FILENO,&rdset)){
+			bzero(buff,sizeof(buff));
+			int ret = read(STDIN_FILENO,buff,sizeof(buff));
+			if(ret==0){
+				//ctrl + d, end input
+				printf("byebye.\n");
+				break;
+			}
+			
+			bzero(&t,sizeof(t));
+			buff[strlen(buff)-1]='\0';
+			parseCommand(buff,strlen(buff),&t);//分析命令
+			sendn(clientfd,&t,4+4+t.len);//发送命令
+
+		}
+		//如果是给服务端发数据,发送文件
+		else if(FD_ISSET(clientfd,&rdset)){
+			if(t.type == CMD_TYPE_PUTS){//puts,上传文件
+				char filename[50] = {0};
+				strcpy(filename,t.buff);
+				int fd = open(filename,O_RDWR);
+				struct stat st;
+				bzero(&st,sizeof(st));
+				fstat(fd,&st);
+				
+				sendn(clientfd,(char*)&st.st_size,sizeof(st.st_size));//发送文件大小
+				int ret = sendfile(clientfd,fd,NULL,st.st_size);//发送文件
+				printf("send %d bytes.\n",ret);
+			}else if(t.type == CMD_TYPE_GETS){//gets,下载文件
+				char filename[50] = {0};
+				int file_len = 0;
+				recvn(clientfd,filename,sizeof(filename));//获取文件名
+				int ret =recvn(clientfd,&file_len,sizeof(file_len));//获取文件长度
+				if(ret != 0){
+					printf("recvn error\n");
+				}
+
+				int fd = open(filename,O_CREAT|O_RDWR|O_TRUNC,0666);
+
+				ftruncate(fd,file_len);
+
+				//最后接收文件内容
+				char * pMap = mmap(NULL, file_len, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+				if(pMap) {//映射成功
+				//clientfd代表的是内核态套接字的缓冲区
+				//pMap代表的是内核文件缓冲区
+					int ret = recv(fd, pMap, file_len, MSG_WAITALL);
+					printf("ret: %d\n", ret);
+				}
+			}else{
+				bzero(buff,sizeof(buff));
+				recv(clientfd,buff,sizeof(buff),0);
+				printf("recv:%s\n",buff);
+			
+			}
+	}
+		
+	close(clientfd);
+	return 0;
+	}
+
+}
